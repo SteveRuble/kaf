@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"os"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"text/tabwriter"
 	"time"
@@ -14,12 +17,15 @@ import (
 	"github.com/birdayz/kaf/avro"
 	"github.com/birdayz/kaf/pkg/proto"
 	"github.com/golang/protobuf/jsonpb"
-	prettyjson "github.com/hokaccha/go-prettyjson"
-	colorable "github.com/mattn/go-colorable"
+	"github.com/hokaccha/go-prettyjson"
+	"github.com/mattn/go-colorable"
 	"github.com/spf13/cobra"
 )
 
 var (
+	tailFlag    int
+	tailsFlag   []int
+	partitionsWhitelistFlag []int
 	offsetFlag  string
 	raw         bool
 	follow      bool
@@ -32,36 +38,35 @@ var (
 func init() {
 	rootCmd.AddCommand(consumeCmd)
 	consumeCmd.Flags().StringVar(&offsetFlag, "offset", "oldest", "Offset to start consuming. Possible values: oldest, newest.")
-	consumeCmd.Flags().BoolVar(&raw, "raw", false, "Print raw output of messages, without key or prettified JSON")
-	consumeCmd.Flags().BoolVarP(&follow, "follow", "f", false, "Shorthand to start consuming with offset HEAD-1 on each partition. Overrides --offset flag")
-	consumeCmd.Flags().StringSliceVar(&protoFiles, "proto-include", []string{}, "Path to proto files")
-	consumeCmd.Flags().StringSliceVar(&protoExclude, "proto-exclude", []string{}, "Proto exclusions (path prefixes)")
-	consumeCmd.Flags().StringVar(&protoType, "proto-type", "", "Fully qualified name of the proto message type. Example: com.test.SampleMessage")
+	consumeCmd.Flags().IntVarP(&tailFlag, "tail", "t", 0, "Number of recent messages to try to read from topic. Overrides --offset flag.")
+	consumeCmd.Flags().IntSliceVarP(&tailsFlag, "tails", "T", []int{}, "Number of recent messages to read from each partition. If only one value is provided, it will be used for each partition; otherwise you must provide a value for each partition. Overrides --offset flag.")
+	consumeCmd.Flags().IntSliceVar(&partitionsWhitelistFlag, "partitions", []int{}, "Partitions to read from; if unset, all partitions will be read.")
+	consumeCmd.Flags().BoolVar(&raw, "raw", false, "Print raw output of messages, without key or prettified JSON.")
+	consumeCmd.Flags().BoolVarP(&follow, "follow", "f", false, "Shorthand to start consuming with offset HEAD-1 on each partition. Overrides --offset flag.")
+	consumeCmd.Flags().StringSliceVar(&protoFiles, "proto-include", []string{}, "Path to proto files.")
+	consumeCmd.Flags().StringSliceVar(&protoExclude, "proto-exclude", []string{}, "Proto exclusions (path prefixes).")
+	consumeCmd.Flags().StringVar(&protoType, "proto-type", "", "Fully qualified name of the proto message type. Example: com.test.SampleMessage.")
 
 	keyfmt = prettyjson.NewFormatter()
 	keyfmt.Newline = " " // Replace newline with space to avoid condensed output.
 	keyfmt.Indent = 0
 }
 
-func getAvailableOffsetsRetry(
-	ldr *sarama.Broker, req *sarama.OffsetRequest, d time.Duration,
-) (*sarama.OffsetResponse, error) {
-	var (
-		err     error
-		offsets *sarama.OffsetResponse
-	)
 
-	for {
-		select {
-		case <-time.After(d):
-			return nil, err
-		default:
-			offsets, err = ldr.GetAvailableOffsets(req)
-			if err == nil {
-				return offsets, err
-			}
-		}
+func getOffsetRange(
+	client sarama.Client, topic string, partition int32,
+) (min int64, max int64, err error) {
+
+	min, err = client.GetOffset(topic, partition, sarama.OffsetOldest)
+	if err != nil {
+		return
 	}
+	max, err = client.GetOffset(topic, partition, sarama.OffsetNewest)
+	if err != nil {
+		return
+	}
+
+	return
 }
 
 const (
@@ -74,19 +79,22 @@ var consumeCmd = &cobra.Command{
 	Short: "Consume messages",
 	Args:  cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
-		var offset int64
+		var allPartitionsOffset int64
 		switch offsetFlag {
 		case "oldest":
-			offset = sarama.OffsetOldest
+			allPartitionsOffset = sarama.OffsetOldest
 		case "newest":
-			offset = sarama.OffsetNewest
+			allPartitionsOffset = sarama.OffsetNewest
 		default:
 			// TODO: normally we would parse this to int64 but it's
 			// difficult as we can have multiple partitions. need to
 			// find a way to give offsets from CLI with a good
 			// syntax.
-			offset = sarama.OffsetNewest
+			allPartitionsOffset = sarama.OffsetNewest
 		}
+
+
+
 		topic := args[0]
 		client := getClient()
 
@@ -116,12 +124,74 @@ var consumeCmd = &cobra.Command{
 			errorExit("Unable to create consumer from client: %v\n", err)
 		}
 
-		partitions, err := consumer.Partitions(topic)
+		foundPartitions, err := consumer.Partitions(topic)
 		if err != nil {
 			errorExit("Unable to get partitions: %v\n", err)
 		}
 
+		// filter partitions
+		var partitions []int
+		if len(partitionsWhitelistFlag) > 0 {
+			// filter the partitions but keep the order the user specified
+			foundPartitionMap := make(map[int32]bool)
+			for _, partition := range foundPartitions{
+				foundPartitionMap[partition] = true
+			}
+			for _, partition := range partitionsWhitelistFlag {
+				if !foundPartitionMap[int32(partition)] {
+					errorExit("Requested partition %d was not found.", partition)
+				}
+				partitions = append(partitions, partition)
+			}
+		} else {
+			for _, partition := range foundPartitions {
+				partitions = append(partitions, int(partition))
+			}
+			// make sure partitions are sorted in a reasonable order if the user provided tails
+			sort.Ints(partitions)
+		}
+		
 		schemaCache = getSchemaCache()
+
+		offsets := make(map[int]int64, len(partitions))
+		offsetDeltas := make(map[int]int64, len(partitions))
+		if tailFlag != 0 {
+			if len(tailsFlag) > 0 {
+				errorExit("The --tail and --tails flags are mutually exclusive, please choose one.")
+			}
+			avgDelta := int(math.Ceil(float64(tailFlag) / float64(len(partitions))))
+			fmt.Fprintf(os.Stderr, "Distributing --tail flag of %d over %d partitions: subtracting %d per partition.\n", tailFlag, len(partitions), avgDelta)
+			tailsFlag = []int{avgDelta}
+		}
+
+		switch len(tailsFlag) {
+		case 0:
+			if follow {
+				fmt.Fprintf(os.Stderr, "Setting all partitions to max offset minus one because of --follow flag.\n")
+				for _, partition := range partitions {
+					offsetDeltas[partition] = 1
+				}
+			} else {
+				for _, partition := range partitions {
+					offsets[partition] = allPartitionsOffset
+				}
+			}
+		case 1:
+			delta := tailsFlag[0]
+			fmt.Fprintf(os.Stderr, "Setting all partitions to max offset minus %d.\n", delta)
+			for _, partition := range partitions {
+				offsetDeltas[partition] = int64(delta)
+			}
+		case len(partitions):
+			for i, partition := range partitions {
+				delta := tailsFlag[i]
+				fmt.Fprintf(os.Stderr, "Setting starting point for partition %d to max offset minus %d\n", partition, delta)
+				offsetDeltas[partition] = int64(delta)
+			}
+		default:
+			errorExit("The --tails flag had %d values, but there are %d partitions available.\n", len(tailsFlag), len(partitions))
+		}
+
 
 		wg := sync.WaitGroup{}
 		mu := sync.Mutex{} // Synchronizes stderr and stdout.
@@ -130,29 +200,33 @@ var consumeCmd = &cobra.Command{
 			wg.Add(1)
 
 			go func(partition int32) {
-				req := &sarama.OffsetRequest{
-					Version: int16(1),
-				}
-				req.AddBlock(topic, partition, int64(-1), int32(0))
-				ldr, err := client.Leader(topic, partition)
+
+				min, max, err := getOffsetRange(client, topic, partition)
 				if err != nil {
-					errorExit("Unable to get leader: %v\n", err)
+					errorExit("Unable to get offsets for partition %d: %v.", partition, err)
 				}
 
-				offsets, err := getAvailableOffsetsRetry(ldr, req, offsetsRetry)
-				if err != nil {
-					errorExit("Unable to get available offsets: %v\n", err)
-				}
-				followOffset := offsets.GetBlock(topic, partition).Offset - 1
-
-				if follow && followOffset > 0 {
-					offset = followOffset
-					fmt.Fprintf(os.Stderr, "Starting on partition %v with offset %v\n", partition, offset)
+				offset, ok := offsets[int(partition)]
+				if !ok {
+					delta := offsetDeltas[int(partition)]
+					offset = max - delta
+					if offset < min {
+						fmt.Fprintf(os.Stderr, "Subtracting tail argument of %d from newest offset %d on partition %v is earlier than the oldest offset %d, using oldest offset instead.\n", delta, max, partition, min)
+						offset = min
+					} else {
+						fmt.Fprintf(os.Stderr, "Starting on partition %v with offset %v\n", partition, offset)
+					}
 				}
 
 				pc, err := consumer.ConsumePartition(topic, partition, offset)
 				if err != nil {
-					errorExit("Unable to consume partition: %v\n", err)
+					if strings.Contains(err.Error(), "outside the range of offsets maintained") {
+						fmt.Fprintf(os.Stderr, "Unable to consume partition %d starting at offset %d (reported offsets %d - %d); will use newest offset; error was: %v\n", partition, allPartitionsOffset, min, max, err)
+						pc, err = consumer.ConsumePartition(topic, partition, sarama.OffsetNewest)
+					}
+					if err != nil {
+						errorExit("Unable to consume partition %d starting at offset %d (reported offsets %d - %d): %v\n", partition, allPartitionsOffset, min, max, err)
+					}
 				}
 
 				for msg := range pc.Messages() {
@@ -163,7 +237,7 @@ var consumeCmd = &cobra.Command{
 					if protoType != "" {
 						dataToDisplay, err = protoDecode(msg.Value, protoType)
 						if err != nil {
-							fmt.Fprintf(&stderr, "failed to decode proto. falling back to binary outputla. Error: %v", err)
+							fmt.Fprintf(&stderr, "failed to decode proto. falling back to binary output. Error: %v", err)
 						}
 					} else {
 						dataToDisplay, err = avroDecode(msg.Value)
@@ -221,7 +295,7 @@ var consumeCmd = &cobra.Command{
 					mu.Unlock()
 				}
 				wg.Done()
-			}(partition)
+			}(int32(partition))
 		}
 		wg.Wait()
 
